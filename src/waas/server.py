@@ -187,13 +187,9 @@ TOOLS = [
                     "type": "string",
                     "description": "ISO 8601 timestamp — only applicants who applied after this date.",
                 },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max results (default 50, max 500).",
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Offset for pagination (default 0).",
+                "cursor": {
+                    "type": "string",
+                    "description": "Pagination cursor from a previous response's next_cursor. Omit for the first page.",
                 },
                 "compact": {
                     "type": "boolean",
@@ -477,7 +473,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
         if not waas.authenticated:
             return [types.TextContent(type="text", text=f"WAAS_API: {NOT_AUTHENTICATED_MSG}")]
         try:
-            waas.get("/v1/applicants", params={"limit": "1"})
+            waas.get("/v1/applicants")
             host = waas.api_host.replace("https://", "").replace("http://", "")
             return [types.TextContent(type="text", text=f"WAAS_API: ok ({host})")]
         except requests.exceptions.HTTPError as e:

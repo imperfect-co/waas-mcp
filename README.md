@@ -63,7 +63,7 @@ Credentials are stored in `~/.yc/waas-credentials.json` and auto-refreshed. Env 
 
 | Tool | Description |
 |------|-------------|
-| `applicant_list` | List candidates who applied to your jobs. Filter by state, needs_response, job_id, since. Supports `compact=true` for triage (see below). |
+| `applicant_list` | List candidates who applied to your jobs. Filter by state, needs_response, job_id, since. Paginate with `cursor` (see below). Supports `compact=true` for triage (see below). |
 
 #### Compact mode
 
@@ -193,6 +193,22 @@ claude mcp add waas \
 **Rate limiting** — The WAAS API rate-limits write operations. When batch-archiving candidates, space out calls or retry on 429 responses.
 
 ## Changelog
+
+### v0.3.0
+
+**Breaking: cursor-based pagination for `applicant_list`**
+
+The `limit` and `offset` parameters have been removed. The API now uses cursor-based pagination, consistent with all other collection endpoints in the YC API.
+
+```
+# First page — omit cursor
+applicant_list()
+
+# Next page — pass next_cursor from previous response
+applicant_list(cursor: "abc123-uuid:50")
+```
+
+The response shape is `{ items: [...], next_cursor: "..." }`. When `next_cursor` is `null`, you've reached the last page. The API returns HTTP 400 with `error: "deprecated_pagination"` if `limit` or `offset` are sent.
 
 ### v0.2.0
 
