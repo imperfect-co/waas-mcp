@@ -17,6 +17,15 @@ uv tool install git+https://github.com/yc-software/waas-mcp
 claude mcp add waas -- waas
 ```
 
+**Requires the `mcp` 2.x Python SDK** (`mcp>=2.0,<3`), which `uv` resolves automatically. If you
+installed before the 2.x migration, a cached environment may still hold `mcp` 1.x and the server
+will fail to start — force a refresh:
+
+```bash
+uvx --refresh --from git+https://github.com/yc-software/waas-mcp waas   # uvx users
+uv tool install --force git+https://github.com/yc-software/waas-mcp     # uv tool users
+```
+
 ### Step 2: Authenticate
 
 ```bash
@@ -193,6 +202,22 @@ claude mcp add waas \
 **Rate limiting** — The WAAS API rate-limits write operations. When batch-archiving candidates, space out calls or retry on 429 responses.
 
 ## Changelog
+
+### Unreleased
+
+**Requires the `mcp` 2.x Python SDK.** The dependency is now pinned to `mcp>=2.0,<3`. `mcp` 2.0
+removed the low-level `@server.list_tools()` / `@server.call_tool()` decorators, so the previously
+unpinned dependency meant fresh installs resolved 2.x and the server failed to start. Existing
+installs with a cached 1.x environment should reinstall with `uvx --refresh` or
+`uv tool install --force` (see Setup).
+
+**Fixes:**
+
+- Startup diagnostics no longer corrupt the JSON-RPC stream. Authentication moved from module
+  import into the server lifespan, so it runs after the stdio transport is established. Importing
+  the server module now performs no network or credential I/O.
+- Every HTTP request to the WAAS API and OAuth token endpoint now sets an explicit timeout, so a
+  hung request can no longer stall startup indefinitely.
 
 ### v0.3.0
 

@@ -15,6 +15,9 @@ from typing import Optional
 CREDENTIALS_DIR = ".yc"
 CREDENTIALS_FILE = "waas-credentials.json"
 CALLBACK_PORT = 19877
+# Seconds to wait on an OAuth token endpoint call. refresh_access_token() runs
+# from the server lifespan, where an unbounded request would hang the handshake.
+TOKEN_REQUEST_TIMEOUT = 30
 OAUTH_SCOPES = [
     "waas:candidates:read",
     "waas:candidates:manage",
@@ -139,6 +142,7 @@ def exchange_code_for_tokens(token_host: str, client_id: str, code: str, code_ve
             "client_id": client_id,
             "code_verifier": code_verifier,
         },
+        timeout=TOKEN_REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
     return resp.json()
@@ -153,7 +157,7 @@ def refresh_access_token(token_host: str, client_id: str, refresh_token: str, cl
     }
     if client_secret:
         data["client_secret"] = client_secret
-    resp = requests.post(f"{token_host}/oauth/token", data=data)
+    resp = requests.post(f"{token_host}/oauth/token", data=data, timeout=TOKEN_REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
 

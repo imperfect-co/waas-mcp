@@ -1,12 +1,19 @@
 import asyncio
 import json
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 from dotenv import load_dotenv
 import requests
 
+from anyio import create_task_group, to_thread
+from jsonschema.exceptions import best_match
+from jsonschema.protocols import Validator
+from jsonschema.validators import validator_for
+
 import mcp.types as types
-from mcp.server import Server, NotificationOptions
+from mcp.server import Server, NotificationOptions, ServerRequestContext
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 
@@ -17,6 +24,12 @@ from .auth import (
     refresh_access_token,
 )
 from .config import get_client_id, get_token_host, get_api_host, get_host_header
+
+
+# Seconds to wait on any WAAS API call. Every request passes this explicitly:
+# connect() now runs from the server lifespan, so an unbounded request would
+# hang the `initialize` handshake rather than merely stalling an import.
+REQUEST_TIMEOUT = 30
 
 
 class WaasClient:
@@ -101,17 +114,17 @@ class WaasClient:
 
     def get(self, endpoint: str, params: Optional[dict] = None) -> dict:
         url = f"{self.api_host}{endpoint}"
-        resp = requests.get(url, headers=self._headers(), params=params)
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
-            resp = requests.get(url, headers=self._headers(), params=params)
+            resp = requests.get(url, headers=self._headers(), params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def post(self, endpoint: str, data: Optional[dict] = None) -> dict:
         url = f"{self.api_host}{endpoint}"
-        resp = requests.post(url, headers=self._headers(), json=data or {})
+        resp = requests.post(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
-            resp = requests.post(url, headers=self._headers(), json=data or {})
+            resp = requests.post(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.content:
             return {"status": "ok"}
@@ -122,18 +135,18 @@ class WaasClient:
         headers = {"Authorization": f"Bearer {self.access_token}"}
         if self.host_header:
             headers["Host"] = self.host_header
-        resp = requests.post(url, headers=headers, data=fields, files=files or {})
+        resp = requests.post(url, headers=headers, data=fields, files=files or {}, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
             headers["Authorization"] = f"Bearer {self.access_token}"
-            resp = requests.post(url, headers=headers, data=fields, files=files or {})
+            resp = requests.post(url, headers=headers, data=fields, files=files or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def put(self, endpoint: str, data: Optional[dict] = None) -> dict:
         url = f"{self.api_host}{endpoint}"
-        resp = requests.put(url, headers=self._headers(), json=data or {})
+        resp = requests.put(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
-            resp = requests.put(url, headers=self._headers(), json=data or {})
+            resp = requests.put(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.content:
             return {"status": "ok"}
@@ -143,12 +156,12 @@ class WaasClient:
 # ---------------------------------------------------------------------------
 # Server setup
 # ---------------------------------------------------------------------------
-server = Server("waas-mcp")
+# Importing this module must stay free of network and credential I/O. connect()
+# runs from the server lifespan instead (see below), which the stdio transport
+# enters only after it has repointed fd 1 away from the JSON-RPC wire.
 load_dotenv()
 
 waas = WaasClient()
-if not waas.connect():
-    print("Failed to initialize WAAS connection", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -459,13 +472,7 @@ def _compact_response(response: dict) -> dict:
     }
 
 
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    return TOOLS
-
-
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+async def _dispatch(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     NOT_AUTHENTICATED_MSG = "Not authenticated. Run 'waas login' in your terminal to get started."
 
     # Health check
@@ -584,6 +591,119 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
         return [types.TextContent(type="text", text=f"WAAS API error on {endpoint}: {e}\n{error_body}")]
     except Exception as e:
         return [types.TextContent(type="text", text=f"Error calling {endpoint}: {e}")]
+
+
+# ---------------------------------------------------------------------------
+# Handler registration (mcp 2.x low-level API)
+# ---------------------------------------------------------------------------
+async def _connect_waas() -> None:
+    """Run the blocking connect() off the event loop, reporting failure instead of raising."""
+    try:
+        if not await to_thread.run_sync(waas.connect, abandon_on_cancel=True):
+            print("Failed to initialize WAAS connection", flush=True)
+    except Exception as e:
+        print(f"Failed to initialize WAAS connection: {e}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(_server: Server) -> AsyncIterator[dict[str, Any]]:
+    """Authenticate in the background once the stdio transport owns fd 1.
+
+    stdio_server() repoints fd 1 at stderr before server.run() enters this, so
+    connect()'s diagnostics can no longer corrupt the JSON-RPC stream the way
+    they did when it ran at import time.
+
+    connect() is synchronous, and on an expired credential it spends up to
+    REQUEST_TIMEOUT seconds inside refresh_access_token(). Awaiting it before the
+    yield would stall the `initialize` handshake for that whole window, so an
+    OAuth outage would take tools/list down with it. It runs in a worker thread
+    started after the yield instead: the handshake and tool listing never wait on
+    a token. Failures are reported and swallowed -- a missing or stale credential
+    must never break `initialize`, and _dispatch's own `authenticated` guard
+    answers any tool call that lands before the token does with the
+    "Not authenticated" message.
+
+    The scope is cancelled on the way out so the async shutdown path never awaits
+    a refresh that is still in flight. Note this does not make process exit
+    instant: anyio's worker threads are non-daemon, so the interpreter still joins
+    the abandoned thread at exit and a disconnect mid-refresh can linger for the
+    remainder of REQUEST_TIMEOUT. A daemon thread would exit promptly but could be
+    frozen partway through save_credentials()' non-atomic write_text(), and a
+    truncated credential file is a worse outcome than a slow exit.
+    """
+    async with create_task_group() as task_group:
+        task_group.start_soon(_connect_waas)
+        try:
+            yield {}
+        finally:
+            task_group.cancel_scope.cancel()
+
+
+async def on_list_tools(
+    _ctx: ServerRequestContext, _params: types.PaginatedRequestParams | None
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=TOOLS)
+
+
+TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
+
+_INPUT_VALIDATORS: dict[str, Validator] = {}
+
+
+def _input_validator(tool: types.Tool) -> Validator:
+    """Compiled validator for a tool's declared input schema, built once per tool.
+
+    Compiling a schema costs roughly 60x a validation pass, so it would dominate
+    every tool call if done inline. TOOLS is a module constant, so a cached
+    validator can never fall out of step with the schema it was built from.
+    """
+    validator = _INPUT_VALIDATORS.get(tool.name)
+    if validator is None:
+        validator = validator_for(tool.input_schema)(tool.input_schema)
+        _INPUT_VALIDATORS[tool.name] = validator
+    return validator
+
+
+def _validation_error(name: str, arguments: dict[str, Any]) -> str | None:
+    """The most relevant schema violation in `arguments`, or None when it is valid.
+
+    The low-level server parses CallToolRequestParams and stops there -- nothing
+    upstream checks arguments against the tool's own inputSchema. Without this, a
+    missing required field or a wrong type reaches _dispatch and goes out to WAAS
+    as a malformed request, coming back as an opaque API error rather than a
+    correctable one.
+    """
+    tool = TOOLS_BY_NAME.get(name)
+    if tool is None:
+        return None  # unknown tool -- _dispatch owns that message
+    error = best_match(_input_validator(tool).iter_errors(arguments))
+    if error is None:
+        return None
+    location = "" if error.json_path == "$" else f" at {error.json_path}"
+    return f"Invalid arguments for {name}{location}: {error.message}"
+
+
+async def on_call_tool(
+    _ctx: ServerRequestContext, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    arguments = params.arguments or {}
+    error = _validation_error(params.name, arguments)
+    if error is not None:
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=error)],
+            is_error=True,
+        )
+    content = await _dispatch(params.name, arguments)
+    return types.CallToolResult(content=content)
+
+
+server = Server(
+    "waas",
+    version="0.1.0",
+    lifespan=lifespan,
+    on_list_tools=on_list_tools,
+    on_call_tool=on_call_tool,
+)
 
 
 # ---------------------------------------------------------------------------
