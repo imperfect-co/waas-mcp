@@ -1,12 +1,14 @@
 import asyncio
 import json
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 from dotenv import load_dotenv
 import requests
 
 import mcp.types as types
-from mcp.server import Server, NotificationOptions
+from mcp.server import Server, NotificationOptions, ServerRequestContext
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 
@@ -17,6 +19,12 @@ from .auth import (
     refresh_access_token,
 )
 from .config import get_client_id, get_token_host, get_api_host, get_host_header
+
+
+# Seconds to wait on any WAAS API call. Every request passes this explicitly:
+# connect() now runs from the server lifespan, so an unbounded request would
+# hang the `initialize` handshake rather than merely stalling an import.
+REQUEST_TIMEOUT = 30
 
 
 class WaasClient:
@@ -101,17 +109,17 @@ class WaasClient:
 
     def get(self, endpoint: str, params: Optional[dict] = None) -> dict:
         url = f"{self.api_host}{endpoint}"
-        resp = requests.get(url, headers=self._headers(), params=params)
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
-            resp = requests.get(url, headers=self._headers(), params=params)
+            resp = requests.get(url, headers=self._headers(), params=params, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def post(self, endpoint: str, data: Optional[dict] = None) -> dict:
         url = f"{self.api_host}{endpoint}"
-        resp = requests.post(url, headers=self._headers(), json=data or {})
+        resp = requests.post(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
-            resp = requests.post(url, headers=self._headers(), json=data or {})
+            resp = requests.post(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.content:
             return {"status": "ok"}
@@ -122,18 +130,18 @@ class WaasClient:
         headers = {"Authorization": f"Bearer {self.access_token}"}
         if self.host_header:
             headers["Host"] = self.host_header
-        resp = requests.post(url, headers=headers, data=fields, files=files or {})
+        resp = requests.post(url, headers=headers, data=fields, files=files or {}, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
             headers["Authorization"] = f"Bearer {self.access_token}"
-            resp = requests.post(url, headers=headers, data=fields, files=files or {})
+            resp = requests.post(url, headers=headers, data=fields, files=files or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def put(self, endpoint: str, data: Optional[dict] = None) -> dict:
         url = f"{self.api_host}{endpoint}"
-        resp = requests.put(url, headers=self._headers(), json=data or {})
+        resp = requests.put(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         if resp.status_code == 401 and self._try_refresh():
-            resp = requests.put(url, headers=self._headers(), json=data or {})
+            resp = requests.put(url, headers=self._headers(), json=data or {}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         if resp.status_code == 204 or not resp.content:
             return {"status": "ok"}
@@ -143,12 +151,12 @@ class WaasClient:
 # ---------------------------------------------------------------------------
 # Server setup
 # ---------------------------------------------------------------------------
-server = Server("waas-mcp")
+# Importing this module must stay free of network and credential I/O. connect()
+# runs from the server lifespan instead (see below), which the stdio transport
+# enters only after it has repointed fd 1 away from the JSON-RPC wire.
 load_dotenv()
 
 waas = WaasClient()
-if not waas.connect():
-    print("Failed to initialize WAAS connection", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -459,13 +467,7 @@ def _compact_response(response: dict) -> dict:
     }
 
 
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
-    return TOOLS
-
-
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+async def _dispatch(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     NOT_AUTHENTICATED_MSG = "Not authenticated. Run 'waas login' in your terminal to get started."
 
     # Health check
@@ -584,6 +586,50 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[types.T
         return [types.TextContent(type="text", text=f"WAAS API error on {endpoint}: {e}\n{error_body}")]
     except Exception as e:
         return [types.TextContent(type="text", text=f"Error calling {endpoint}: {e}")]
+
+
+# ---------------------------------------------------------------------------
+# Handler registration (mcp 2.x low-level API)
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_server: Server) -> AsyncIterator[dict[str, Any]]:
+    """Authenticate once the stdio transport owns fd 1.
+
+    stdio_server() repoints fd 1 at stderr before server.run() enters this, so
+    connect()'s diagnostics can no longer corrupt the JSON-RPC stream the way
+    they did when it ran at import time. Failures are reported and swallowed:
+    a missing or stale credential must never break the `initialize` handshake,
+    and _dispatch's own `authenticated` guard already answers every tool call
+    with the "Not authenticated" message.
+    """
+    try:
+        if not waas.connect():
+            print("Failed to initialize WAAS connection", flush=True)
+    except Exception as e:
+        print(f"Failed to initialize WAAS connection: {e}", flush=True)
+    yield {}
+
+
+async def on_list_tools(
+    _ctx: ServerRequestContext, _params: types.PaginatedRequestParams | None
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=TOOLS)
+
+
+async def on_call_tool(
+    _ctx: ServerRequestContext, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    content = await _dispatch(params.name, params.arguments or {})
+    return types.CallToolResult(content=content)
+
+
+server = Server(
+    "waas-mcp",
+    version="0.1.0",
+    lifespan=lifespan,
+    on_list_tools=on_list_tools,
+    on_call_tool=on_call_tool,
+)
 
 
 # ---------------------------------------------------------------------------
